@@ -1,0 +1,15 @@
+[package]
+name = "cosmic-swipe"
+version = "0.1.0"
+edition = "2024"
+description = "Four-finger up/down touchpad gestures for the COSMIC desktop: Workspaces overview and App Library"
+license = "MIT"
+repository = "https://github.com/dsscheib/cosmic-swipe"
+readme = "README.md"
+keywords = ["cosmic", "touchpad", "gestures", "pop-os", "wayland"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+evdev = { version = "0.13.2", default-features = false }
+futures-util = { version = "0.3.34", default-features = false }
+zbus = { version = "6.5.0", default-features = false, features = ["default-rt"] }
