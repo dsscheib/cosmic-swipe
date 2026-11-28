@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-swipe"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Touchpad gestures for the COSMIC desktop: Workspaces overview, App Library and workspace switching in the overview"
 license = "MIT"
