@@ -1,17 +1,22 @@
 # cosmic-swipe
 
-Four-finger up/down touchpad gestures for the COSMIC desktop, in Rust.
+Touchpad gestures for the COSMIC desktop that it doesn't have yet, in Rust.
 
 | Gesture | Overview closed | Overview open |
 |---|---|---|
 | 4 fingers up | Open the Workspaces overview | Nothing |
 | 4 fingers down | Open the App Library | Close the overview |
 | 4 fingers left/right | COSMIC's own workspace switching (untouched) | — |
+| 3 fingers left/right | Nothing | Previous / next workspace (the one on that side) |
 
 COSMIC (cosmic-comp on Pop!_OS 24.04) handles four-finger left/right itself but ignores
-up/down. This fills that gap until COSMIC ships it natively
-([pop-os/cosmic-comp#2838](https://github.com/pop-os/cosmic-comp/pull/2838)); once it does,
-uninstall this to avoid double actions.
+up/down, and does nothing with three-finger swipes. This fills that gap until COSMIC ships it
+natively ([pop-os/cosmic-comp#2838](https://github.com/pop-os/cosmic-comp/pull/2838)); once it
+does, uninstall this to avoid double actions.
+
+Three-finger switching follows COSMIC's *Workspace wraparound* setting. With several monitors,
+it switches the first monitor's workspaces, since the protocol doesn't say which monitor the
+overview is on.
 
 ## No `input` group needed
 
@@ -56,8 +61,9 @@ Environment=COSMIC_SWIPE_DEVICE=/dev/input/event7   # pin a device instead of au
 | Piece | Mechanism |
 |---|---|
 | Touchpad | `evdev` crate: raw multitouch slots, palms excluded, finger count also from `BTN_TOOL_*` |
-| Recognition | `src/gesture.rs`: average motion of the four fingers in mm (kernel resolution), one action per gesture, re-armed when all fingers lift. Unit tested. |
+| Recognition | `src/gesture.rs`: average motion of the fingers in mm (kernel resolution), one action per gesture, re-armed when all fingers lift. A gesture that had more fingers than a detector wants never fires it, so lifting off a four-finger swipe isn't a three-finger one. Unit tested. |
 | Overview | `zbus`: `com.system76.CosmicWorkspaces` `Show` / `Hide`, open state from its `Shown` / `Hidden` signals |
+| Workspaces | `wayland-client`: the `ext_workspace_manager_v1` protocol, `activate` on the neighbouring workspace then `commit` |
 | App Library | `cosmic-app-library`, the command Super+A runs |
 
 Reading the touchpad is non-exclusive: COSMIC keeps receiving every event as usual.

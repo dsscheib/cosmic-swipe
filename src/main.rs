@@ -1,10 +1,12 @@
-//! cosmic-swipe: four-finger up/down touchpad gestures for the COSMIC desktop.
+//! cosmic-swipe: touchpad gestures COSMIC does not have yet.
 //!
-//!   4 fingers up    open the Workspaces overview
-//!   4 fingers down  close the overview, or open the App Library from the desktop
+//!   4 fingers up          open the Workspaces overview
+//!   4 fingers down        close the overview, or open the App Library from the desktop
+//!   3 fingers left/right  in the overview, switch to the workspace on that side
 //!
 //! COSMIC already handles four-finger left/right (workspace switching) itself, so those are
 //! recognized only to keep a sideways swipe from turning into a vertical one, then ignored.
+//! Workspaces are switched through the Wayland ext-workspace-v1 protocol (see workspaces.rs).
 //!
 //! The touchpad is read directly through evdev. It needs read access to the touchpad device
 //! only, which the bundled udev rule grants to the logged-in user; the `input` group is not
@@ -13,6 +15,7 @@
 
 mod gesture;
 mod touchpad;
+mod workspaces;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -26,6 +29,7 @@ use zbus::{Connection, MatchRule, MessageStream, message};
 
 use gesture::{Config, Detector, Direction, TapDetector};
 use touchpad::Touchpad;
+use workspaces::Workspaces;
 
 const WORKSPACES: &str = "com.system76.CosmicWorkspaces";
 const WORKSPACES_PATH: &str = "/com/system76/CosmicWorkspaces";
@@ -95,13 +99,23 @@ enum Action {
     HideOverview,
     OpenAppLibrary,
     CloseAppLibrary,
+    NextWorkspace,
+    PreviousWorkspace,
     None,
 }
 
 impl Action {
     /// What a swipe does, given what is open. The App Library takes precedence: opening the
     /// overview over it would close it anyway, as the overview takes keyboard focus.
-    fn for_swipe(dir: Direction, overview_open: bool, library_open: bool) -> Self {
+    fn for_swipe(fingers: usize, dir: Direction, overview_open: bool, library_open: bool) -> Self {
+        if fingers == 3 {
+            // The swipe points at the workspace to go to: left goes to the one on the left.
+            return match (dir, overview_open) {
+                (Direction::Left, true) => Self::PreviousWorkspace,
+                (Direction::Right, true) => Self::NextWorkspace,
+                _ => Self::None,
+            };
+        }
         match (dir, overview_open, library_open) {
             (Direction::Up, _, true) => Self::CloseAppLibrary,
             (Direction::Up, false, false) => Self::ShowOverview,
@@ -190,6 +204,13 @@ fn watch_overview(shown: Arc<AtomicBool>, library_open: Arc<AtomicBool>) {
     }
 }
 
+fn switch(workspaces: &Workspaces, step: i32) {
+    match workspaces.switch(step) {
+        Ok(name) => eprintln!("  now on workspace {name}"),
+        Err(e) => eprintln!("  workspace switch skipped: {e}"),
+    }
+}
+
 fn spawn(cmd: &str) {
     // Detached: the child's exit status is not needed. `wait` happens on a short-lived thread
     // so the process never lingers as a zombie.
@@ -222,6 +243,7 @@ fn main() {
         thread::spawn(move || watch_overview(shown, library_open));
     }
     let mut overview = Overview::default();
+    let workspaces = if args.dry_run { Workspaces::default() } else { Workspaces::start() };
 
     eprintln!(
         "cosmic-swipe {} started{}",
@@ -242,17 +264,19 @@ fn main() {
                     tp.units_per_mm_x,
                     tp.units_per_mm_y
                 );
-                let mut det = Detector::new(Config {
+                let cfg = |fingers| Config {
+                    fingers,
                     distance_mm,
                     dominance,
                     units_per_mm_x: tp.units_per_mm_x,
                     units_per_mm_y: tp.units_per_mm_y,
-                });
+                };
+                let mut detectors = [Detector::new(cfg(4)), Detector::new(cfg(3))];
                 let mut taps = TapDetector::new(tp.units_per_mm_x);
                 let mut gesture_start = 0.0;
                 let mut prev_fingers = 0;
                 let err = tp.run(|f| {
-                    if f.fingers == 4 && prev_fingers != 4 {
+                    if f.fingers != prev_fingers && (f.fingers == 3 || f.fingers == 4) {
                         gesture_start = f.time;
                     }
                     prev_fingers = f.fingers;
@@ -263,14 +287,23 @@ fn main() {
                             if f.clicked { "click" } else { "tap" });
                     }
 
-                    let Some(dir) = det.frame(f.fingers, f.touches) else { return };
+                    // Every detector sees every frame, so none loses track of the fingers.
+                    let fired = detectors.each_mut().map(|d| d.frame(f.fingers, f.touches));
+                    let Some((fingers, dir)) = fired
+                        .into_iter()
+                        .zip([4, 3])
+                        .find_map(|(dir, n)| Some((n, dir?)))
+                    else {
+                        return;
+                    };
                     let action = Action::for_swipe(
+                        fingers,
                         dir,
                         shown.load(Ordering::Relaxed),
                         library_open.load(Ordering::Relaxed),
                     );
                     eprintln!(
-                        "swipe {dir:?} after {:.0} ms -> {action:?}",
+                        "{fingers}-finger swipe {dir:?} after {:.0} ms -> {action:?}",
                         (f.time - gesture_start) * 1000.0
                     );
                     if args.dry_run {
@@ -287,6 +320,8 @@ fn main() {
                             spawn(APP_LIBRARY_CMD); // the command toggles it
                             library_open.store(false, Ordering::Relaxed);
                         }
+                        Action::NextWorkspace => switch(&workspaces, 1),
+                        Action::PreviousWorkspace => switch(&workspaces, -1),
                         Action::None => {}
                     }
                 });
@@ -314,23 +349,29 @@ mod tests {
 
     #[test]
     fn up_from_app_library_closes_it_instead_of_opening_the_overview() {
-        assert_eq!(Action::for_swipe(Up, false, true), Action::CloseAppLibrary);
+        assert_eq!(Action::for_swipe(4, Up, false, true), Action::CloseAppLibrary);
     }
 
     #[test]
     fn swipe_table() {
-        // (direction, overview open, library open) -> action
+        // (fingers, direction, overview open, library open) -> action
         let cases = [
-            (Up, false, false, Action::ShowOverview),
-            (Up, true, false, Action::None),
-            (Down, false, false, Action::OpenAppLibrary),
-            (Down, false, true, Action::None),
-            (Down, true, false, Action::HideOverview),
-            (Left, false, false, Action::None),
-            (Right, true, false, Action::None),
+            (4, Up, false, false, Action::ShowOverview),
+            (4, Up, true, false, Action::None),
+            (4, Down, false, false, Action::OpenAppLibrary),
+            (4, Down, false, true, Action::None),
+            (4, Down, true, false, Action::HideOverview),
+            (4, Left, false, false, Action::None),
+            (4, Right, true, false, Action::None),
+            (3, Left, true, false, Action::PreviousWorkspace),
+            (3, Right, true, false, Action::NextWorkspace),
+            (3, Left, false, false, Action::None),
+            (3, Right, false, true, Action::None),
+            (3, Up, true, false, Action::None),
+            (3, Down, true, false, Action::None),
         ];
-        for (dir, ov, lib, want) in cases {
-            assert_eq!(Action::for_swipe(dir, ov, lib), want, "{dir:?} ov={ov} lib={lib}");
+        for (n, dir, ov, lib, want) in cases {
+            assert_eq!(Action::for_swipe(n, dir, ov, lib), want, "{n} {dir:?} ov={ov} lib={lib}");
         }
     }
 }

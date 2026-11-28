@@ -1,7 +1,7 @@
-//! Four-finger swipe recognition from raw multitouch frames.
+//! Multi-finger swipe recognition from raw multitouch frames.
 //!
 //! This module is pure logic: it takes one frame of touch points at a time and decides when a
-//! four-finger swipe has travelled far enough, and in which direction. It knows nothing about
+//! swipe with a given number of fingers has travelled far enough, and in which direction. It knows nothing about
 //! devices or D-Bus, so it can be unit tested without hardware.
 
 /// Direction of a recognized swipe, in screen terms (up = fingers moved toward the top).
@@ -24,6 +24,8 @@ pub struct Touch {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
+    /// Number of fingers the swipe is made with.
+    pub fingers: usize,
     /// Travel along the main axis, in millimetres, before a swipe fires.
     pub distance_mm: f64,
     /// The main axis must beat the other one by this factor.
@@ -33,15 +35,17 @@ pub struct Config {
     pub units_per_mm_y: f64,
 }
 
-/// Fires at most one direction per four-finger gesture.
+/// Fires at most one direction per gesture made with `Config::fingers` fingers.
 ///
-/// A gesture starts when exactly four fingers are down and ends when the count changes.
+/// A gesture starts when exactly that many fingers are down and ends when the count changes.
+/// Once more fingers than that have touched down, nothing fires until every finger lifts, so
+/// lifting off after a four-finger swipe never counts as a three-finger one.
 /// Motion is the average movement of the fingers present in both consecutive frames, so a
 /// finger landing or lifting never shows up as a jump.
 pub struct Detector {
     cfg: Config,
     prev: Vec<Touch>,
-    /// Accumulated travel of the current four-finger gesture, in millimetres.
+    /// Accumulated travel of the current gesture, in millimetres.
     dx: f64,
     dy: f64,
     /// Whether the current gesture already fired.
@@ -60,19 +64,21 @@ impl Detector {
     }
 
     /// Feeds one frame (every finger currently down, palms already excluded) and returns a
-    /// direction the first time the current four-finger gesture crosses the threshold.
+    /// direction the first time the current gesture crosses the threshold.
     ///
     /// `fingers` is the finger count. It is usually `touches.len()`, but touchpads with fewer
-    /// multitouch slots than fingers report the true count through BTN_TOOL_QUADTAP, so the
+    /// multitouch slots than fingers report the true count through BTN_TOOL_*TAP, so the
     /// caller passes the larger of the two.
     pub fn frame(&mut self, fingers: usize, touches: &[Touch]) -> Option<Direction> {
         let prev_fingers = self.prev.len();
         let prev = std::mem::replace(&mut self.prev, touches.to_vec());
 
-        if fingers != 4 {
+        if fingers != self.cfg.fingers {
             self.dx = 0.0;
             self.dy = 0.0;
-            if fingers == 0 {
+            if fingers > self.cfg.fingers {
+                self.fired = true;
+            } else if fingers == 0 {
                 // Re-arm only once every finger is up, so a finger briefly dropping out
                 // in the middle of a long swipe cannot fire it a second time.
                 self.fired = false;
@@ -108,7 +114,7 @@ impl Detector {
             Some(if self.dy < 0.0 { Direction::Up } else { Direction::Down })
         } else if ax >= self.cfg.distance_mm && ax > self.cfg.dominance * ay {
             // Reported so a sideways swipe uses up the gesture and cannot turn into a
-            // vertical one halfway through. COSMIC handles left/right itself.
+            // vertical one halfway through.
             Some(if self.dx < 0.0 { Direction::Left } else { Direction::Right })
         } else {
             None
@@ -170,6 +176,7 @@ mod tests {
     use super::*;
 
     const CFG: Config = Config {
+        fingers: 4,
         distance_mm: 12.0,
         dominance: 1.5,
         units_per_mm_x: 10.0,
@@ -256,6 +263,40 @@ mod tests {
             .filter_map(|i| det.frame(4, &four(0, -10 * i)))
             .collect();
         assert!(more.is_empty());
+    }
+
+    const CFG3: Config = Config { fingers: 3, ..CFG };
+
+    #[test]
+    fn three_finger_detector_fires_on_three() {
+        let mut det = Detector::new(CFG3);
+        let fired: Vec<_> = (0..=30)
+            .filter_map(|i| det.frame(3, &four(-10 * i, 0)[..3]))
+            .collect();
+        assert_eq!(fired, vec![Direction::Left]);
+    }
+
+    #[test]
+    fn three_finger_detector_ignores_four() {
+        let mut det = Detector::new(CFG3);
+        assert!(swipe(&mut det, -10, 0, 30).is_empty());
+    }
+
+    #[test]
+    fn lifting_off_a_four_finger_swipe_is_not_a_three_finger_one() {
+        let mut det = Detector::new(CFG3);
+        assert!(swipe(&mut det, 10, 0, 10).is_empty());
+        // one finger lifts, the other three keep sliding right
+        let more: Vec<_> = (11..=60)
+            .filter_map(|i| det.frame(3, &four(10 * i, 0)[..3]))
+            .collect();
+        assert!(more.is_empty());
+        // all fingers up re-arms it
+        assert_eq!(det.frame(0, &[]), None);
+        let fired: Vec<_> = (0..=30)
+            .filter_map(|i| det.frame(3, &four(10 * i, 0)[..3]))
+            .collect();
+        assert_eq!(fired, vec![Direction::Right]);
     }
 
     #[test]
